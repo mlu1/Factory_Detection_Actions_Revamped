@@ -1,0 +1,50 @@
+{
+  "monitoring_config": {
+    "completion_activities": ["Putting Down", "Processing"],
+    "min_handling_time_seconds": 2.0,
+    "report_interval_seconds": 300,
+    "productivity_target_items_per_hour": 10,
+    "quality_threshold": 0.8
+  },
+  "detection_config": {
+    "object_model_path": "yolo26x.pt",
+    "pose_model_path": "yolov8n-pose.pt",
+    "confidence_threshold": 0.5,
+    "tracking_buffer_frames": 30,
+    "smoothing_frames": 10,
+    "consistency_threshold": 6
+  },
+  "interaction_thresholds": {
+    "wrist_detection_margin": 15,
+    "up_movement_threshold": -3.0,
+    "down_movement_threshold": 3.0,
+    "movement_tolerance": 15,
+    "hand_movement_threshold": 3.0,
+    "horizontal_movement_threshold": 3.0
+  },
+  "video_config": {
+    "video_source": "test_video.mp4",
+    "rtsp_url": "rtsp://admin:password@192.168.1.100:554/stream1",
+    "frame_width": 640,
+    "frame_height": 480,
+    "buffer_size": 1
+  },
+  "database_config": {
+    "database_path": "factory_monitoring.db",
+    "backup_interval_hours": 24,
+    "data_retention_days": 30
+  },
+  "alerts": {
+    "low_productivity_threshold": 50,
+    "extended_idle_time_minutes": 10,
+    "quality_drop_threshold": 0.7,
+    "enable_email_alerts": false,
+    "email_recipients": ["manager@company.com"]
+  },
+  "shift_config": {
+    "shift_start_hour": 8,
+    "shift_end_hour": 17,
+    "break_times": ["12:00", "15:00"],
+    "break_duration_minutes": 15
+  }
+}

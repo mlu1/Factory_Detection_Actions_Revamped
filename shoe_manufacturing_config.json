@@ -1,0 +1,64 @@
+{
+  "manufacturing_type": "bicycle_seats",
+  "monitoring_config": {
+    "completion_activities": ["Putting Down", "Processing", "Assembly Complete"],
+    "min_handling_time_seconds": 4.0,
+    "report_interval_seconds": 240,
+    "productivity_target_items_per_hour": 6,
+    "quality_threshold": 0.90
+  },
+  "detection_config": {
+    "object_model_path": "yolo26x.pt",
+    "pose_model_path": "yolov8n-pose.pt", 
+    "confidence_threshold": 0.6,
+    "tracking_buffer_frames": 35,
+    "smoothing_frames": 12,
+    "consistency_threshold": 7
+  },
+  "bicycle_seat_config": {
+    "seat_components": ["base", "padding", "cover", "rails", "nose", "saddle_body"],
+    "assembly_stages": ["cutting", "padding_attachment", "cover_installation", "rail_mounting", "finishing", "quality_check"],
+    "defect_detection": true,
+    "size_tracking": ["narrow", "medium", "wide", "xl"],
+    "color_variants": ["black", "brown", "white", "red", "blue", "custom"]
+  },
+  "interaction_thresholds": {
+    "wrist_detection_margin": 18,
+    "up_movement_threshold": -4.0,
+    "down_movement_threshold": 4.0,
+    "movement_tolerance": 18,
+    "hand_movement_threshold": 2.5,
+    "horizontal_movement_threshold": 3.5,
+    "precision_work_threshold": 1.5
+  },
+  "bicycle_seat_activities": {
+    "padding_attachment": "Attaching padding to seat base",
+    "cover_installation": "Installing seat cover", 
+    "cutting": "Cutting material patterns",
+    "gluing": "Applying adhesive",
+    "pressing": "Heat/pressure application",
+    "rail_mounting": "Mounting seat rails",
+    "trimming": "Trimming excess material",
+    "inspection": "Quality inspection",
+    "packaging": "Final packaging"
+  },
+  "quality_metrics": {
+    "stitching_quality": 0.9,
+    "sole_alignment": 0.95,
+    "finishing_quality": 0.85,
+    "overall_craftsmanship": 0.9
+  },
+  "production_targets": {
+    "seats_per_hour_per_worker": 6,
+    "daily_target_per_worker": 48,
+    "quality_pass_rate": 95,
+    "rework_rate_threshold": 5
+  },
+  "alerts": {
+    "low_productivity_threshold": 60,
+    "quality_drop_threshold": 0.8,
+    "extended_idle_time_minutes": 8,
+    "defect_rate_threshold": 10,
+    "enable_supervisor_alerts": true
+  }
+}
