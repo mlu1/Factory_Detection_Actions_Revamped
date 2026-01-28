@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import time
+from orientation_detector import OrientationDetector, Orientation, OrientationChange
+from completion_zone_detector import CompletionZoneDetector, CompletionEvent
 
 @dataclass
 class BicycleSeatAssemblyEvent:
@@ -23,6 +25,7 @@ class BicycleSeatAssemblyEvent:
     seat_size: str = "Unknown"
     color: str = "Unknown"
     defects_detected: List[str] = None
+    orientation_changes_during_assembly: int = 0  # Track orientation changes during assembly
 
 @dataclass
 class EmployeeSession:
@@ -37,6 +40,7 @@ class EmployeeSession:
     quality_average: float = 0.0
     current_seat_start_time: Optional[datetime.datetime] = None
     assembly_stage: str = "preparation"
+    orientation_changes: int = 0  # Track total orientation changes performed
 
 class BicycleSeatFactoryMonitoringSystem:
     def __init__(self, config_path="bicycle_seat_config.json", db_path="bicycle_seat_factory_monitoring.db"):
@@ -55,6 +59,17 @@ class BicycleSeatFactoryMonitoringSystem:
         # Performance metrics
         self.session_start_time = datetime.datetime.now()
         self.total_seats_produced = 0
+        
+        # Orientation tracking for bicycle seats
+        self.orientation_detector = OrientationDetector(
+            history_size=10, 
+            confidence_threshold=0.7
+        )
+        self.task_start_orientations = {}  # track_id -> orientation count when task started
+        
+        # Completion zone tracking for bicycle seat assembly
+        self.completion_zone_detector = CompletionZoneDetector()
+        self.zone_completions = []  # List of CompletionEvent from zones
         
         # Activity definitions specific to bicycle seat manufacturing
         self.seat_activities = self.config.get('bicycle_seat_activities', {})
@@ -147,6 +162,38 @@ class BicycleSeatFactoryMonitoringSystem:
             )
         ''')
         
+        # Orientation changes table for bicycle seat assembly
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orientation_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                employee_id TEXT,
+                track_id INTEGER,
+                previous_orientation TEXT,
+                new_orientation TEXT,
+                confidence REAL,
+                assembly_stage TEXT,
+                during_task TEXT
+            )
+        ''')
+        
+        # Completion zone events table for bicycle seat assembly
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS completion_zone_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                employee_id TEXT,
+                track_id INTEGER,
+                zone_name TEXT,
+                time_to_complete REAL,
+                assembly_stage TEXT,
+                bbox_x REAL,
+                bbox_y REAL,
+                bbox_w REAL,
+                bbox_h REAL
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         
@@ -190,6 +237,11 @@ class BicycleSeatFactoryMonitoringSystem:
         session = self.employee_sessions[track_id]
         current_time = datetime.datetime.now()
         
+        # Track task start for orientation counting
+        if new_activity != "None" and session.current_activity == "None":
+            # Starting a new task - record current orientation count
+            self.task_start_orientations[track_id] = session.orientation_changes
+        
         # If activity changed, log the previous activity
         if new_activity != session.current_activity:
             if session.current_activity != "None" and session.last_activity_change:
@@ -223,10 +275,12 @@ class BicycleSeatFactoryMonitoringSystem:
         
         # Only count as completion if handling time is reasonable for bicycle seat work
         if completion_time >= self.min_handling_time:
+            # Calculate orientation changes during this assembly
+            task_start_count = self.task_start_orientations.get(track_id, session.orientation_changes)
+            orientation_changes_during_assembly = session.orientation_changes - task_start_count
+            
             session.seats_completed += 1
             self.total_seats_produced += 1
-            
-            print(f"🚴 Bicycle seat completed by {session.employee_id} (Total: {session.seats_completed})")
             
             # Estimate quality score based on completion time and consistency
             target_time = 3600 / self.config['production_targets']['seats_per_hour_per_worker']
@@ -238,13 +292,14 @@ class BicycleSeatFactoryMonitoringSystem:
                 seat_type="Standard",
                 assembly_stage=session.assembly_stage,
                 completion_time=completion_time,
-                quality_score=quality_score
+                quality_score=quality_score,
+                orientation_changes_during_assembly=orientation_changes_during_assembly
             )
             
             self.completed_seats.append(completion_event)
             self.save_seat_completion(completion_event)
             
-            print(f"🚴 Seat completed by {session.employee_id} (Total: {session.seats_completed}, Quality: {quality_score:.2f})")
+            print(f"🚴 Seat completed by {session.employee_id} (Total: {session.seats_completed}, Quality: {quality_score:.2f}, Orientations: {orientation_changes_during_assembly})")
             
     def calculate_seat_productivity_score(self, session: EmployeeSession) -> float:
         """Calculate productivity score specific to bicycle seat manufacturing"""
@@ -315,13 +370,161 @@ class BicycleSeatFactoryMonitoringSystem:
             })
             
         return summary
+    
+    def process_orientation_change(self, orientation_change: OrientationChange):
+        """Process and log orientation changes in bicycle seat assembly"""
+        if orientation_change.track_id in self.employee_sessions:
+            session = self.employee_sessions[orientation_change.track_id]
+            session.orientation_changes += 1
+            
+            # Log to database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO orientation_changes 
+                (timestamp, employee_id, track_id, previous_orientation, new_orientation, 
+                 confidence, assembly_stage, during_task)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                orientation_change.timestamp.isoformat(),
+                session.employee_id,
+                orientation_change.track_id,
+                orientation_change.previous_orientation.value,
+                orientation_change.new_orientation.value,
+                orientation_change.confidence,
+                session.assembly_stage,
+                session.current_activity
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"🔄 {session.employee_id} ({session.assembly_stage}): {orientation_change.previous_orientation.value} → {orientation_change.new_orientation.value}")
+    
+    def update_object_tracking(self, track_id: int, bbox: tuple, frame: np.ndarray):
+        """Update object tracking with orientation and completion zone detection for bicycle seat assembly"""
+        # Update orientation detection
+        orientation_change = self.orientation_detector.update_orientation(track_id, bbox, frame)
+        
+        # Process any orientation changes
+        if orientation_change:
+            self.process_orientation_change(orientation_change)
+        
+        # Update completion zone detection
+        completion_event = self.completion_zone_detector.update_object_tracking(
+            track_id, bbox, self.employee_sessions, datetime.datetime.now()
+        )
+        
+        # Process any completion zone events
+        if completion_event:
+            self.process_completion_zone_event(completion_event)
+    
+    def process_completion_zone_event(self, completion_event: CompletionEvent):
+        """Process completion zone events for bicycle seat assembly"""
+        if completion_event.track_id in self.employee_sessions:
+            session = self.employee_sessions[completion_event.track_id]
+            
+            # Only count edge completions as actual bicycle seat completions
+            if completion_event.zone_name == "Edge_Completion":
+                # Calculate orientation changes during this assembly
+                task_start_count = self.task_start_orientations.get(completion_event.track_id, session.orientation_changes)
+                orientation_changes_during_assembly = session.orientation_changes - task_start_count
+                
+                session.seats_completed += 1
+                self.total_seats_produced += 1
+                
+                # Estimate quality score based on completion time
+                target_time = 3600 / self.config['production_targets']['seats_per_hour_per_worker']
+                quality_score = max(0.5, min(1.0, target_time / completion_event.time_to_complete))
+                
+                # Create enhanced completion event
+                seat_completion = BicycleSeatAssemblyEvent(
+                    timestamp=completion_event.timestamp,
+                    employee_id=completion_event.employee_id,
+                    seat_type="Standard",
+                    assembly_stage=session.assembly_stage,
+                    completion_time=completion_event.time_to_complete,
+                    quality_score=quality_score,
+                    orientation_changes_during_assembly=orientation_changes_during_assembly
+                )
+                
+                self.completed_seats.append(seat_completion)
+                self.save_seat_completion(seat_completion)
+                
+                print(f"🚴 {completion_event.employee_id} completed bicycle seat by placing in {completion_event.zone_name} (Time: {completion_event.time_to_complete:.1f}s, Quality: {quality_score:.2f}, Orientations: {orientation_changes_during_assembly})")
+            
+            # Log to database
+            self.save_completion_zone_event(completion_event)
+            
+            # Store in our list
+            self.zone_completions.append(completion_event)
+    
+    def save_completion_zone_event(self, completion_event: CompletionEvent):
+        """Save completion zone event to database"""
+        if completion_event.track_id in self.employee_sessions:
+            session = self.employee_sessions[completion_event.track_id]
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            x, y, w, h = completion_event.bbox
+            cursor.execute('''
+                INSERT INTO completion_zone_events 
+                (timestamp, employee_id, track_id, zone_name, time_to_complete, 
+                 assembly_stage, bbox_x, bbox_y, bbox_w, bbox_h)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                completion_event.timestamp.isoformat(),
+                completion_event.employee_id,
+                completion_event.track_id,
+                completion_event.zone_name,
+                completion_event.time_to_complete,
+                session.assembly_stage,
+                x, y, w, h
+            ))
+            
+            conn.commit()
+            conn.close()
+    
+    def get_orientation_summary(self) -> Dict:
+        """Get summary of orientation changes in bicycle seat assembly"""
+        total_changes = sum(session.orientation_changes for session in self.employee_sessions.values())
+        
+        # Get recent changes (last hour)
+        one_hour_ago = datetime.datetime.now() - datetime.timedelta(hours=1)
+        recent_changes = self.orientation_detector.get_orientation_changes(since=one_hour_ago)
+        
+        summary = {
+            "total_orientation_changes": total_changes,
+            "recent_changes_last_hour": len(recent_changes),
+            "active_orientations": {},
+            "assembly_stage_orientations": {}
+        }
+        
+        # Get current orientations for active objects
+        for track_id, session in self.employee_sessions.items():
+            orientation = self.orientation_detector.get_current_orientation(track_id)
+            summary["active_orientations"][session.employee_id] = orientation.value
+            
+            # Group by assembly stage
+            stage = session.assembly_stage
+            if stage not in summary["assembly_stage_orientations"]:
+                summary["assembly_stage_orientations"][stage] = []
+            summary["assembly_stage_orientations"][stage].append({
+                "employee": session.employee_id,
+                "orientation": orientation.value,
+                "orientation_changes": session.orientation_changes
+            })
+            
+        return summary
 
 def draw_bicycle_seat_monitoring_overlay(frame, monitoring_system):
     """Draw bicycle seat manufacturing specific monitoring information"""
     overlay = frame.copy()
     
-    # Semi-transparent background for info panel
-    cv2.rectangle(overlay, (10, 10), (450, 160), (0, 0, 0), -1)
+    # Larger semi-transparent background for info panel
+    cv2.rectangle(overlay, (10, 10), (550, 240), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
     # Title
@@ -345,14 +548,25 @@ def draw_bicycle_seat_monitoring_overlay(frame, monitoring_system):
     cv2.putText(frame, f"Rate: {rate:.1f} seats/hour", (20, 120), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
     
+    # Orientation changes summary
+    total_orientation_changes = sum(session.orientation_changes for session in monitoring_system.employee_sessions.values())
+    cv2.putText(frame, f"Orientation Changes: {total_orientation_changes}", (20, 140), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
+    
+    # Completion zone summary
+    zone_counts = monitoring_system.completion_zone_detector.get_zone_counts()
+    edge_count = zone_counts.get("Edge_Completion", 0)
+    cv2.putText(frame, f"Seats in Completion: {edge_count}", (20, 160), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    
     # Individual worker info
-    y_offset = 140
+    y_offset = 180
     for session in monitoring_system.employee_sessions.values():
         productivity = monitoring_system.calculate_seat_productivity_score(session)
-        info_text = f"{session.employee_id}: {session.seats_completed} seats ({productivity:.1f}%)"
+        info_text = f"{session.employee_id}: {session.seats_completed} seats ({productivity:.1f}%, {session.orientation_changes} orient)"
         cv2.putText(frame, info_text, (20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-        y_offset += 20
+        y_offset += 18
         
     return frame
 
@@ -395,6 +609,11 @@ if __name__ == "__main__":
         success, frame = cap.read()
 
         if success:
+            # Auto-configure completion zones based on frame size (first frame only)
+            if frame is not None and len(monitoring_system.completion_zone_detector.completion_zones) == 0:
+                h, w = frame.shape[:2]
+                monitoring_system.completion_zone_detector.configure_zones_from_frame(w, h)
+            
             # Object Detection & Tracking
             obj_results = object_model.track(frame, persist=True, verbose=False)[0]
             
@@ -420,9 +639,28 @@ if __name__ == "__main__":
                     if track_id not in monitoring_system.employee_sessions:
                         monitoring_system.register_employee(track_id)
 
-                    # Draw labels with worker ID and activity
+                    # Update orientation tracking for this object
+                    monitoring_system.update_object_tracking(track_id, (x, y, w, h), frame)
+                    
+                    # Draw orientation info on the frame
+                    frame = monitoring_system.orientation_detector.draw_orientation_info(frame, (x, y, w, h), track_id)
+
+                    # Draw labels with worker ID, activity, and orientation
                     action = object_interactions[track_id]
                     if action != "None":
+                        employee_id = monitoring_system.employee_sessions[track_id].employee_id
+                        orientation = monitoring_system.orientation_detector.get_current_orientation(track_id)
+                        assembly_stage = monitoring_system.employee_sessions[track_id].assembly_stage
+                        label = f"{employee_id}: {action} | {orientation.value} | {assembly_stage}"
+                        cv2.putText(frame, label, (int(x - w/2), int(y - h/2) - 40),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 2)
+                
+                # Clean up orientation tracking for inactive objects
+                monitoring_system.orientation_detector.cleanup_old_tracks(track_ids)
+                monitoring_system.completion_zone_detector.cleanup_old_tracks(track_ids)
+            
+            # Draw completion zones
+            frame = monitoring_system.completion_zone_detector.draw_zones(frame)
                         worker_id = monitoring_system.employee_sessions[track_id].employee_id
                         stage = monitoring_system.employee_sessions[track_id].assembly_stage
                         label = f"{worker_id}: {action} ({stage})"
@@ -561,6 +799,13 @@ if __name__ == "__main__":
             elif key == ord("s"):  # Print summary
                 summary = monitoring_system.get_production_summary()
                 print(json.dumps(summary, indent=2))
+            elif key == ord("o"):  # Print orientation summary
+                orientation_summary = monitoring_system.get_orientation_summary()
+                print("\n" + "="*50)
+                print("🔄 BICYCLE SEAT ORIENTATION SUMMARY")
+                print("="*50)
+                print(json.dumps(orientation_summary, indent=2))
+                print("="*50 + "\n")
                 
         else:
             break
@@ -571,7 +816,7 @@ if __name__ == "__main__":
     print("="*60)
     for session in monitoring_system.employee_sessions.values():
         productivity = monitoring_system.calculate_seat_productivity_score(session)
-        print(f"{session.employee_id}: {session.seats_completed} bicycle seats completed ({productivity:.1f}% productivity)")
+        print(f"{session.employee_id}: {session.seats_completed} bicycle seats completed ({productivity:.1f}% productivity, {session.orientation_changes} orientation changes)")
     print("="*60)
 
     cap.release()

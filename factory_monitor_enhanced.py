@@ -10,6 +10,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 import time
+from orientation_detector import OrientationDetector, Orientation, OrientationChange
+from completion_zone_detector import CompletionZoneDetector, CompletionEvent
 
 @dataclass
 class EmployeeSession:
@@ -21,6 +23,7 @@ class EmployeeSession:
     total_handling_time: float = 0.0
     last_activity_change: datetime.datetime = None
     productivity_score: float = 0.0
+    orientation_changes: int = 0  # Track orientation changes performed
 
 @dataclass
 class ItemCompletionEvent:
@@ -30,6 +33,7 @@ class ItemCompletionEvent:
     item_type: str
     completion_time: float  # Time taken to complete this item
     quality_score: float = 1.0  # Can be enhanced with quality detection
+    orientation_changes_during_task: int = 0  # Number of orientation changes during this task
 
 class FactoryMonitoringSystem:
     def __init__(self, db_path="factory_monitoring.db"):
@@ -47,6 +51,17 @@ class FactoryMonitoringSystem:
         # Performance metrics
         self.session_start_time = datetime.datetime.now()
         self.total_items_produced = 0
+        
+        # Orientation tracking
+        self.orientation_detector = OrientationDetector(
+            history_size=10, 
+            confidence_threshold=0.7
+        )
+        self.task_start_orientations = {}  # track_id -> orientation count when task started
+        
+        # Completion zone tracking
+        self.completion_zone_detector = CompletionZoneDetector()
+        self.zone_completions = []  # List of CompletionEvent from zones
         
         # Configuration
         self.completion_keywords = ["Putting Down", "Processing"]  # Activities that indicate item completion
@@ -93,6 +108,36 @@ class FactoryMonitoringSystem:
             )
         ''')
         
+        # Orientation changes table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS orientation_changes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                employee_id TEXT,
+                track_id INTEGER,
+                previous_orientation TEXT,
+                new_orientation TEXT,
+                confidence REAL,
+                during_task TEXT
+            )
+        ''')
+        
+        # Completion zone events table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS completion_zone_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT,
+                employee_id TEXT,
+                track_id INTEGER,
+                zone_name TEXT,
+                time_to_complete REAL,
+                bbox_x REAL,
+                bbox_y REAL,
+                bbox_w REAL,
+                bbox_h REAL
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         
@@ -118,6 +163,11 @@ class FactoryMonitoringSystem:
             
         session = self.employee_sessions[track_id]
         current_time = datetime.datetime.now()
+        
+        # Track task start for orientation counting
+        if new_activity != "None" and session.current_activity == "None":
+            # Starting a new task - record current orientation count
+            self.task_start_orientations[track_id] = session.orientation_changes
         
         # If activity changed, log the previous activity duration
         if new_activity != session.current_activity:
@@ -146,6 +196,10 @@ class FactoryMonitoringSystem:
         
         # Only count as completion if handling time is reasonable
         if completion_time >= self.min_handling_time:
+            # Calculate orientation changes during this task
+            task_start_count = self.task_start_orientations.get(track_id, session.orientation_changes)
+            orientation_changes_during_task = session.orientation_changes - task_start_count
+            
             session.items_completed += 1
             self.total_items_produced += 1
             
@@ -153,13 +207,14 @@ class FactoryMonitoringSystem:
                 timestamp=datetime.datetime.now(),
                 employee_id=session.employee_id,
                 item_type="Standard",  # Can be enhanced with object classification
-                completion_time=completion_time
+                completion_time=completion_time,
+                orientation_changes_during_task=orientation_changes_during_task
             )
             
             self.completed_items.append(completion_event)
             self.save_item_completion(completion_event)
             
-            print(f"✅ Item completed by {session.employee_id} (Total: {session.items_completed})")
+            print(f"✅ Item completed by {session.employee_id} (Total: {session.items_completed}, Orientations: {orientation_changes_during_task})")
             
     def calculate_productivity_score(self, session: EmployeeSession) -> float:
         """Calculate productivity score for an employee"""
@@ -236,6 +291,133 @@ class FactoryMonitoringSystem:
             json.dump(report, f, indent=2)
             
         return filename
+    
+    def process_orientation_change(self, orientation_change: OrientationChange):
+        """Process and log orientation changes"""
+        if orientation_change.track_id in self.employee_sessions:
+            session = self.employee_sessions[orientation_change.track_id]
+            session.orientation_changes += 1
+            
+            # Log to database
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                INSERT INTO orientation_changes 
+                (timestamp, employee_id, track_id, previous_orientation, new_orientation, confidence, during_task)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                orientation_change.timestamp.isoformat(),
+                session.employee_id,
+                orientation_change.track_id,
+                orientation_change.previous_orientation.value,
+                orientation_change.new_orientation.value,
+                orientation_change.confidence,
+                session.current_activity
+            ))
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"🔄 {session.employee_id}: {orientation_change.previous_orientation.value} → {orientation_change.new_orientation.value} (confidence: {orientation_change.confidence:.2f})")
+    
+    def update_object_tracking(self, track_id: int, bbox: tuple, frame: np.ndarray):
+        """Update object tracking with orientation and completion zone detection"""
+        # Update orientation detection
+        orientation_change = self.orientation_detector.update_orientation(track_id, bbox, frame)
+        
+        # Process any orientation changes
+        if orientation_change:
+            self.process_orientation_change(orientation_change)
+        
+        # Update completion zone detection
+        completion_event = self.completion_zone_detector.update_object_tracking(
+            track_id, bbox, self.employee_sessions, datetime.datetime.now()
+        )
+        
+        # Process any completion zone events
+        if completion_event:
+            self.process_completion_zone_event(completion_event)
+    
+    def process_completion_zone_event(self, completion_event: CompletionEvent):
+        """Process completion zone events and update metrics"""
+        if completion_event.track_id in self.employee_sessions:
+            session = self.employee_sessions[completion_event.track_id]
+            
+            # Only count edge completions as actual item completions
+            if completion_event.zone_name == "Edge_Completion":
+                session.items_completed += 1
+                self.total_items_produced += 1
+                
+                # Calculate orientation changes during this task
+                task_start_count = self.task_start_orientations.get(completion_event.track_id, session.orientation_changes)
+                orientation_changes_during_task = session.orientation_changes - task_start_count
+                
+                # Create enhanced completion event
+                item_completion = ItemCompletionEvent(
+                    timestamp=completion_event.timestamp,
+                    employee_id=completion_event.employee_id,
+                    item_type="Standard",
+                    completion_time=completion_event.time_to_complete,
+                    orientation_changes_during_task=orientation_changes_during_task
+                )
+                
+                self.completed_items.append(item_completion)
+                self.save_item_completion(item_completion)
+                
+                print(f"📦 {completion_event.employee_id} completed item by placing in {completion_event.zone_name} (Time: {completion_event.time_to_complete:.1f}s, Orientations: {orientation_changes_during_task})")
+            
+            # Log to database
+            self.save_completion_zone_event(completion_event)
+            
+            # Store in our list
+            self.zone_completions.append(completion_event)
+    
+    def save_completion_zone_event(self, completion_event: CompletionEvent):
+        """Save completion zone event to database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        x, y, w, h = completion_event.bbox
+        cursor.execute('''
+            INSERT INTO completion_zone_events 
+            (timestamp, employee_id, track_id, zone_name, time_to_complete, 
+             bbox_x, bbox_y, bbox_w, bbox_h)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            completion_event.timestamp.isoformat(),
+            completion_event.employee_id,
+            completion_event.track_id,
+            completion_event.zone_name,
+            completion_event.time_to_complete,
+            x, y, w, h
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_orientation_summary(self) -> Dict:
+        """Get summary of orientation changes"""
+        total_changes = sum(session.orientation_changes for session in self.employee_sessions.values())
+        
+        # Get recent changes (last hour)
+        one_hour_ago = datetime.datetime.now() - datetime.timedelta(hours=1)
+        recent_changes = self.orientation_detector.get_orientation_changes(since=one_hour_ago)
+        
+        summary = {
+            "total_orientation_changes": total_changes,
+            "recent_changes_last_hour": len(recent_changes),
+            "active_orientations": {}
+        }
+        
+        # Get current orientations for active objects
+        for track_id, session in self.employee_sessions.items():
+            orientation = self.orientation_detector.get_current_orientation(track_id)
+            summary["active_orientations"][session.employee_id] = orientation.value
+            
+        return summary
+            
+        return filename
 
 class VideoStream:
     def read(self):
@@ -296,8 +478,8 @@ def draw_monitoring_overlay(frame, monitoring_system):
     """Draw monitoring information on the frame"""
     overlay = frame.copy()
     
-    # Semi-transparent background for info panel
-    cv2.rectangle(overlay, (10, 10), (400, 150), (0, 0, 0), -1)
+    # Larger semi-transparent background for info panel
+    cv2.rectangle(overlay, (10, 10), (500, 240), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
     
     # Title
@@ -315,11 +497,22 @@ def draw_monitoring_overlay(frame, monitoring_system):
     cv2.putText(frame, f"Active Employees: {len(monitoring_system.employee_sessions)}", (20, 100), 
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
     
+    # Orientation summary
+    total_orientation_changes = sum(session.orientation_changes for session in monitoring_system.employee_sessions.values())
+    cv2.putText(frame, f"Orientation Changes: {total_orientation_changes}", (20, 120), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
+    
+    # Completion zone summary
+    zone_counts = monitoring_system.completion_zone_detector.get_zone_counts()
+    edge_count = zone_counts.get("Edge_Completion", 0)
+    cv2.putText(frame, f"Items in Completion: {edge_count}", (20, 140), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+    
     # Individual employee info
-    y_offset = 120
+    y_offset = 160
     for session in monitoring_system.employee_sessions.values():
         productivity = monitoring_system.calculate_productivity_score(session)
-        info_text = f"{session.employee_id}: {session.items_completed} items ({productivity:.1f}%)"
+        info_text = f"{session.employee_id}: {session.items_completed} items ({productivity:.1f}%, {session.orientation_changes} orient)"
         cv2.putText(frame, info_text, (20, y_offset), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
         y_offset += 20
@@ -363,6 +556,11 @@ if __name__ == "__main__":
         success, frame = cap.read()
 
         if success:
+            # Auto-configure completion zones based on frame size (first frame only)
+            if frame is not None and len(monitoring_system.completion_zone_detector.completion_zones) == 0:
+                h, w = frame.shape[:2]
+                monitoring_system.completion_zone_detector.configure_zones_from_frame(w, h)
+            
             # --- A. Object Detection & Tracking ---
             obj_results = object_model.track(frame, persist=True, verbose=False)[0]
             
@@ -388,13 +586,27 @@ if __name__ == "__main__":
                     if track_id not in monitoring_system.employee_sessions:
                         monitoring_system.register_employee(track_id)
 
+                    # Update orientation tracking for this object
+                    monitoring_system.update_object_tracking(track_id, (x, y, w, h), frame)
+                    
+                    # Draw orientation info on the frame
+                    frame = monitoring_system.orientation_detector.draw_orientation_info(frame, (x, y, w, h), track_id)
+
                     # Draw Action Label with employee ID
                     action = object_interactions[track_id]
                     if action != "None":
                         employee_id = monitoring_system.employee_sessions[track_id].employee_id
-                        label = f"{employee_id}: {action}"
-                        cv2.putText(frame, label, (int(x - w/2), int(y - h/2) - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                        orientation = monitoring_system.orientation_detector.get_current_orientation(track_id)
+                        label = f"{employee_id}: {action} | {orientation.value}"
+                        cv2.putText(frame, label, (int(x - w/2), int(y - h/2) - 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                
+                # Clean up orientation tracking for inactive objects
+                monitoring_system.orientation_detector.cleanup_old_tracks(track_ids)
+                monitoring_system.completion_zone_detector.cleanup_old_tracks(track_ids)
+            
+            # Draw completion zones
+            frame = monitoring_system.completion_zone_detector.draw_zones(frame)
 
             # --- B. Pose/Hand Detection ---
             pose_results = pose_model(frame, verbose=False)[0]
@@ -519,6 +731,13 @@ if __name__ == "__main__":
             elif key == ord("s"):  # Print summary
                 summary = monitoring_system.get_shift_summary()
                 print(json.dumps(summary, indent=2))
+            elif key == ord("o"):  # Print orientation summary
+                orientation_summary = monitoring_system.get_orientation_summary()
+                print("\n" + "="*40)
+                print("ORIENTATION SUMMARY")
+                print("="*40)
+                print(json.dumps(orientation_summary, indent=2))
+                print("="*40 + "\n")
                 
         else:
             break
@@ -526,7 +745,7 @@ if __name__ == "__main__":
     # Save final session data
     for session in monitoring_system.employee_sessions.values():
         productivity = monitoring_system.calculate_productivity_score(session)
-        print(f"Final stats for {session.employee_id}: {session.items_completed} items, {productivity:.1f}% productivity")
+        print(f"Final stats for {session.employee_id}: {session.items_completed} items, {productivity:.1f}% productivity, {session.orientation_changes} orientation changes")
 
     cap.release()
     cv2.destroyAllWindows()
